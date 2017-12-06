@@ -39,7 +39,7 @@ from arbotix_python.follow_controller import FollowController
 from arbotix_python.servo_controller import *
 from arbotix_python.linear_controller import *
 from arbotix_python.publishers import *
-from arbotix_python.io import *
+from arbotix_python.arb_io import *
 
 # name: [ControllerClass, pause]
 controller_types = { "follow_controller" : FollowController,
@@ -62,8 +62,8 @@ class ArbotixROS(ArbotiX):
         self.rate = rospy.get_param("~rate", 100.0)
         self.fake = rospy.get_param("~sim", False)
 
-        self.use_sync_read = rospy.get_param("~sync_read",True)      # use sync read?
-        self.use_sync_write = rospy.get_param("~sync_write",True)    # use sync write?
+        self.use_sync_read = rospy.get_param("~sync_read",False)      # use sync read?
+        self.use_sync_write = rospy.get_param("~sync_write",False)    # use sync write?
 
         # setup publishers
         self.diagnostics = DiagnosticsPublisher()
@@ -91,8 +91,9 @@ class ArbotixROS(ArbotiX):
         # setup controller
         self.controllers = [ServoController(self, "servos"), ]
         controllers = rospy.get_param("~controllers", dict())
+ 
         for name, params in controllers.items():
-            try:
+            try:          
                 controller = controller_types[params["type"]](self, name)
                 self.controllers.append( controller )
                 pause = pause or controller.pause
@@ -133,6 +134,7 @@ class ArbotixROS(ArbotiX):
         
         r = rospy.Rate(self.rate)
 
+        print 'Using rate of %f' % self.rate
         # main loop -- do all the read/write here
         while not rospy.is_shutdown():
     
@@ -145,6 +147,7 @@ class ArbotixROS(ArbotiX):
                 io.update()
 
             # publish feedback
+           
             self.joint_state_publisher.update(self.joints.values(), self.controllers)
             self.diagnostics.update(self.joints.values(), self.controllers)
 

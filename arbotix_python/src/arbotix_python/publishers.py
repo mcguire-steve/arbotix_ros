@@ -83,6 +83,7 @@ class JointStatePublisher:
                 msg.name.append(joint.name)
                 msg.position.append(joint.position)
                 msg.velocity.append(joint.velocity)
+                msg.effort.append(joint.load)
             for controller in controllers:
                 msg.name += controller.joint_names
                 msg.position += controller.joint_positions

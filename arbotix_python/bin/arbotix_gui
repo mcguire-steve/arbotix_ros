@@ -35,7 +35,7 @@ from math import radians
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64
-from arbotix_msgs.srv import Relax
+from arbotix_msgs.srv import Enable
 from arbotix_python.joints import *
 
 width = 325
@@ -46,13 +46,28 @@ class servoSlider():
         if name.find("_joint") > 0: # remove _joint for display name
             name = name[0:-6]
         self.position = wx.Slider(parent, -1, 0, int(min_angle*100), int(max_angle*100), wx.DefaultPosition, (150, -1), wx.SL_HORIZONTAL)
-        self.enabled = wx.CheckBox(parent, i, name+":")
+        self.enabled = wx.CheckBox(parent, i, "en:")
+        self.command = wx.CheckBox(parent, i, name+':')
+        
+        self.pos_value = wx.TextCtrl(parent)
+        
         self.enabled.SetValue(False)
         self.position.Disable()
-
+        def OnEnter(event, servoName = name):
+            self.position.SetValue(float(self.pos_value.GetValue())*100)
+            
+        self.pos_value.Bind(wx.EVT_TEXT_ENTER, OnEnter)
+        
     def setPosition(self, angle):
+        #This is called from a different thread than the UI thread...
         self.position.SetValue(int(angle*100))
+        wx.CallAfter(self.pos_value.SetValue,
+                     str(angle)[:6])
 
+    def setTextPos(self, angle):
+        wx.CallAfter(self.pos_value.SetValue,
+                     str(angle)[:6])
+        
     def getPosition(self):
         return self.position.GetValue()/100.0
 
@@ -102,20 +117,29 @@ class controllerGUI(wx.Frame):
             # create publisher
             self.publishers.append(rospy.Publisher(name+'/command', Float64, queue_size=5))
             if rospy.get_param('/arbotix/joints/'+name+'/type','dynamixel') == 'dynamixel':
-                self.relaxers.append(rospy.ServiceProxy(name+'/relax', Relax))
+                self.relaxers.append(rospy.ServiceProxy(name+'/enable', Enable))
             else:
                 self.relaxers.append(None)
             # create slider
             s = servoSlider(self, min_angle, max_angle, name, i)
-            servoSizer.Add(s.enabled,(i,0), wx.GBSpan(1,1),wx.ALIGN_CENTER_VERTICAL)   
-            servoSizer.Add(s.position,(i,1), wx.GBSpan(1,1),wx.ALIGN_CENTER_VERTICAL)
+            servoSizer.Add(s.command, (i,0), wx.GBSpan(1,1), wx.ALIGN_CENTER_VERTICAL)
+            servoSizer.Add(s.enabled,(i,1), wx.GBSpan(1,1),wx.ALIGN_CENTER_VERTICAL)   
+            servoSizer.Add(s.position,(i,2), wx.GBSpan(1,1),wx.ALIGN_CENTER_VERTICAL)
+            servoSizer.Add(s.pos_value, (i,3), wx.GBSpan(1,1), wx.ALIGN_CENTER_VERTICAL)
+
+            #Bind the checkboxes:
+ 
+                        
+            s.command.Bind(wx.EVT_CHECKBOX, self.OnCommandCheck)
+            s.enabled.Bind(wx.EVT_CHECKBOX, self.OnEnableCheck)
+            
             self.servos.append(s)
             i += 1
 
         # add everything
         servoBox.Add(servoSizer) 
         sizer.Add(servoBox, (0,1), wx.GBSpan(1,1), wx.EXPAND|wx.TOP|wx.BOTTOM|wx.RIGHT,5)
-        self.Bind(wx.EVT_CHECKBOX, self.enableSliders)
+        #self.Bind(wx.EVT_CHECKBOX, self.enableSliders)
         # now we can subscribe
         rospy.Subscriber('joint_states', JointState, self.stateCb)
 
@@ -137,22 +161,49 @@ class controllerGUI(wx.Frame):
         self.timer.Stop()
         self.Destroy()
 
-    def enableSliders(self, event):
+        #Two separate checkboxes:
+        #Enable the sliders, and enable the servos
+    def OnCommandCheck(self, event):
         servo = event.GetId()
-        if event.IsChecked(): 
+        if event.IsChecked():
             self.servos[servo].position.Enable()
         else:
             self.servos[servo].position.Disable()
+        
+    def OnEnableCheck(self, event):
+        servo = event.GetId()
+        if event.IsChecked():
             if self.relaxers[servo]:
-                self.relaxers[servo]()
+                self.relaxers[servo](True)
+        else:
+            if self.relaxers[servo]:
+                self.relaxers[servo](False)
+                
+    def enableSliders(self, event):
+        print event
+        servo = event.GetId()
+        if event.IsChecked(): 
+            self.servos[servo].position.Enable()
+            if self.relaxers[servo]:
+                self.relaxers[servo](True)
+        else:
+            self.servos[servo].position.Disable()
+            if self.relaxers[servo]:
+                self.relaxers[servo](False)
 
     def stateCb(self, msg):        
         for servo in self.servos:
-            if not servo.enabled.IsChecked():
+            if not servo.command.IsChecked():
                 try:
                     idx = msg.name.index(servo.name)
                     servo.setPosition(msg.position[idx])
                 except: 
+                    pass
+            else:
+                try:
+                    idx = msg.name.index(servo.name)
+                    servo.setTextPos(msg.position[idx])
+                except:
                     pass
 
     def onPaint(self, event=None):
@@ -184,7 +235,7 @@ class controllerGUI(wx.Frame):
     def onTimer(self, event=None):
         # send joint updates
         for s,p in zip(self.servos,self.publishers):
-            if s.enabled.IsChecked():
+            if s.enabled.IsChecked() and s.command.IsChecked():
                 d = Float64()
                 d.data = s.getPosition()
                 p.publish(d)

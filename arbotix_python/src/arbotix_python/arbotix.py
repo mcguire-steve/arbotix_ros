@@ -31,7 +31,8 @@
 ## @file arbotix.py Low-level code to control an ArbotiX.
 
 import serial, time, sys, thread
-from ax12 import *
+
+from scorpx import *
 from struct import unpack
 
 ## @brief This class controls an ArbotiX, USBDynamixel, or similar board through a serial connection.
@@ -45,7 +46,8 @@ class ArbotiX:
     ##
     ## @param timeout The timeout to use for the port. When operating over a wireless link, you may need to
     ## increase this.
-    def __init__(self, port="/dev/ttyUSB0",baud=115200, timeout = 0.1):
+    ## Slightly large, since the bootloader takes a few seconds to run too
+    def __init__(self, port="/dev/ttyUSB0",baud=115200, timeout = 0.5, connectAttempts = 10):
         self._mutex = thread.allocate_lock()
         self._ser = serial.Serial()
         
@@ -54,219 +56,128 @@ class ArbotiX:
         self._ser.timeout = timeout
         self._ser.open()
 
-        ## The last error level read back
-        self.error = 0
+       
+        #Wait for reset
+        attempts = 0
+        while attempts  < connectAttempts:
+            print 'Connection attempt %d...' % attempts
+            self._ser.write(b'1 1 20 0\r') #exit from machine mode or print the menu
+            firstRead = ",".join(self._ser.readlines())
+            if firstRead.count("machine interface") > 0:
+                break
+            attempts += 1
+            
+        #Put the device into a known state:
+        
+        #Get the servo list
+        self._ser.write(b'8\r')
 
-    ## @brief Read a dynamixel return packet in an iterative attempt.
-    ##
-    ## @param mode This should be 0 to start reading packet. 
-    ##
-    ## @return The error level returned by the device. 
-    def getPacket(self, mode, id=-1, leng=-1, error=-1, params = None):
-        try:
-            d = self._ser.read()     
-        except Exception as e:
-            print e
-            return None
-        # need a positive byte
-        if d == '':
-            return None
+        #Get the servo count from the first response:
+        response = self._ser.readlines()
+        #print 'Input:'
+        #print response
+        servoCountLine = response[0].split(" ")
+        servoCount = int(servoCountLine[1])
+        print 'Found %d servos!' % servoCount
 
-        # now process our byte
-        if mode == 0:           # get our first 0xFF
-            if ord(d) == 0xff:   
-                return self.getPacket(1)
-            else:
-                return self.getPacket(0)
-        elif mode == 1:         # get our second 0xFF
-            if ord(d) == 0xff:
-                return self.getPacket(2)
-            else:
-                return self.getPacket(0)
-        elif mode == 2:         # get id
-            if d != 0xff:
-                return self.getPacket(3, ord(d))
-            else:              
-                return self.getPacket(0)
-        elif mode == 3:         # get length
-            return self.getPacket(4, id, ord(d))
-        elif mode == 4:         # read error    
-            self.error = ord(d)
-            if leng == 2:
-                return self.getPacket(6, id, leng, ord(d), list())
-            else:
-                return self.getPacket(5, id, leng, ord(d), list())
-        elif mode == 5:         # read params
-            params.append(ord(d))
-            if len(params) + 2 == leng:
-                return self.getPacket(6, id, leng, error, params)
-            else:
-                return self.getPacket(5, id, leng, error, params)
-        elif mode == 6:         # read checksum
-            checksum = id + leng + error + sum(params) + ord(d)
-            if checksum % 256 != 255:
-                return None
-            return params
-        # fail
-        return None
+        self.servoMap = dict()
+        responseLine = 2;
+        for index in range(0,servoCount):
+            mapLine = response[responseLine].split(":");
+            self.servoMap[index] = ServoState(mapLine[1])
+            responseLine+= 1
 
-    ## @brief Send an instruction to the device. 
-    ##
-    ## @param index The ID of the servo to write.
-    ##
-    ## @param ins The instruction to send.
-    ##
-    ## @param params A list of the params to send.
-    ##
-    ## @param ret Whether to read a return packet.
-    ##
-    ## @return The return packet, if read.
-    def execute(self, index, ins, params, ret=True):
-        values = None
+        #print 'Servo map:'
+        #print self.servoMap
+
+        #Switch to machine mode
+        self._ser.write(b'10\r')
+
+        #Consume the response
+        self._ser.readline()
+        
+        #Kick off the service loop
+        thread.start_new_thread(self.serviceLoop, ())
+        
+    def serviceLoop(self):
+        cmds = []
+        cmds.append(FWCommand(self.servoMap[0].id,SX_NOOP, 0))
+        while True:
+            self.writeCommands(cmds)
+            time.sleep(0.05) #10hz update over the serial
+
+    def writeCommands(self, cmdList):
+        if len(cmdList) == 0:
+            return
+        #print 'Writing %d commands...' % len(cmdList)
+        #Write the number of commands first
         self._mutex.acquire()  
-        try:      
-            self._ser.flushInput()
-        except Exception as e:
-            print e
-        length = 2 + len(params)
-        checksum = 255 - ((index + length + ins + sum(params))%256)
-        try: 
-            self._ser.write(chr(0xFF)+chr(0xFF)+chr(index)+chr(length)+chr(ins))
-        except Exception as e:
-            print e
-            self._mutex.release()
-            return None
-        for val in params:
-            try:
-                self._ser.write(chr(val))
-            except Exception as e:
-                print e
-                self._mutex.release()
-                return None
-        try:
-            self._ser.write(chr(checksum))
-        except Exception as e:
-            print e
-            self._mutex.release()
-            return None
-        if ret:
-            values = self.getPacket(0)
-        self._mutex.release()
-        return values
-    
-    ## @brief Read values of registers.
-    ##
-    ## @param index The ID of the servo.
-    ## 
-    ## @param start The starting register address to begin the read at.
-    ##
-    ## @param length The number of bytes to read.
-    ##
-    ## @return A list of the bytes read, or -1 if failure.
-    def read(self, index, start, length):
-        values = self.execute(index, AX_READ_DATA, [start, length])
-        if values == None:
-            return -1        
-        else:
-            return values
+        self._ser.write(str(len(cmdList))+' ')
 
-    ## @brief Write values to registers.
-    ##
-    ## @param index The ID of the servo.
-    ##
-    ## @param start The starting register address to begin writing to.
-    ##
-    ## @param values The data to write, in a list.
-    ##
-    ## @return The error level.
-    def write(self, index, start, values):
-        self.execute(index, AX_WRITE_DATA, [start] + values)
-        return self.error     
+        for cmd in cmdList:
+            #print '%d %d %d\n' % (cmd.id, cmd.cmd, cmd.value)
+            self._ser.write(str(cmd.id) + ' ')
+            self._ser.write(str(cmd.cmd) + ' ')
+            self._ser.write(str(cmd.value) + ' ')
+       
+        self._ser.write(b'\r')
+        
+        #After we write, read from the port to pick up the status line
+        #First char: number of servos that we have status on
 
-    ## @brief Write values to registers on many servos.
-    ##
-    ## @param start The starting register address to begin writing to.
-    ##
-    ## @param values The data to write, in a list of lists. Format should be
-    ## [(id1, val1, val2), (id2, val1, val2)]
-    def syncWrite(self, start, values):
-        output = list()
-        for i in values:
-            output = output + i 
-        length = len(output) + 4                # length of overall packet
-        lbytes = len(values[0])-1               # length of bytes to write to a servo               
-        self._mutex.acquire()  
-        try:      
-            self._ser.flushInput()
-        except:
-            pass  
-        self._ser.write(chr(0xFF)+chr(0xFF)+chr(254)+chr(length)+chr(AX_SYNC_WRITE))        
-        self._ser.write(chr(start))              # start address
-        self._ser.write(chr(lbytes))             # bytes to write each servo
-        for i in output:
-            self._ser.write(chr(i))
-        checksum = 255 - ((254 + length + AX_SYNC_WRITE + start + lbytes + sum(output))%256)
-        self._ser.write(chr(checksum))
+        numServos = struct.unpack("<B", self._ser.read(1))
+
+        #print 'reading status for %d servos' % numServos[0]
+        for i in range(0,numServos[0]):
+            #print 'Updating servo %d' % i
+            #This assumes that the mapping is well known for each servo already
+            #print 'Record is %d bytes long' % self.servoMap[i].getLength()
+            self.servoMap[i].update(self._ser.read(self.servoMap[i].getLength()))
         self._mutex.release()
 
-    ## @brief Read values of registers on many servos.
-    ##
-    ## @param servos A list of the servo IDs to read from.
-    ##
-    ## @param start The starting register address to begin reading at.
-    ##
-    ## @param length The number of bytes to read from each servo.
-    ##
-    ## @return A list of bytes read.
-    def syncRead(self, servos, start, length):
-        return self.execute(0xFE, AX_SYNC_READ, [start, length] + servos )
-    
-    ## @brief Set baud rate of a device.
-    ##
-    ## @param index The ID of the device to write (Note: ArbotiX is 253).
-    ##
-    ## @param baud The baud rate.
-    ##
-    ## @return The error level.
-    def setBaud(self, index, baud):
-        return self.write(index, P_BAUD_RATE, [baud, ])
+    def updateState(self):
+        cmds = []
+        cmds.append(FWCommand(self.servoMap[0].id,SX_NOOP, 0))
+        self.writeCommands(cmds)
 
-    ## @brief Get the return level of a device.
-    ##
-    ## @param index The ID of the device to read.
-    ##
-    ## @return The return level, .
-    def getReturnLevel(self, index):
-        try:
-            return int(self.read(index, P_RETURN_LEVEL, 1)[0])
-        except:
-            return -1
-
-    ## @brief Set the return level of a device.
-    ##
-    ## @param index The ID of the device to write.
-    ##
-    ## @param value The return level.
-    ##
-    ## @return The error level.
-    def setReturnLevel(self, index, value):
-        return self.write(index, P_RETURN_LEVEL, [value])        
-
+    def printStatusAll(self):
+        self.printStatus(self.servoMap.keys())
+        
+    def printStatus(self, indexes):
+        for i in indexes:
+            #print 'state of %s' % i
+            state = self.servoMap[int(i)]
+            print '%d: id %d: Pos: %d Mov: %d En: %d LED: %d' % (int(i),
+                                                                state.id,
+                                                                state.position,
+                                                                state.moving,
+                                                                state.enabled,
+                                                                state.led)
+            
+                                                            
+                                                            
     ## @brief Turn on the torque of a servo.
     ##
-    ## @param index The ID of the device to enable.
+    ## @param index List of IDs to enable.
     ##
     ## @return The error level.
-    def enableTorque(self, index):
-        return self.write(index, P_TORQUE_ENABLE, [1])
+    def enableTorque(self, indexes):
+        cmds = []
+        for i in indexes:
+            cmds.append(FWCommand(self.servoMap[int(i)].id,SX_SET_ENABLED, 1))
+        self.writeCommands(cmds)
+        
 
     ## @brief Turn on the torque of a servo.
     ##
     ## @param index The ID of the device to disable.
     ##
     ## @return The error level.
-    def disableTorque(self, index):
-        return self.write(index, P_TORQUE_ENABLE, [0])
+    def disableTorque(self, indexes):
+        cmds = []
+        for i in indexes:
+            cmds.append(FWCommand(self.servoMap[int(i)].id,SX_SET_ENABLED, 0))
+        self.writeCommands(cmds)
 
     ## @brief Set the status of the LED on a servo.
     ##
@@ -275,9 +186,18 @@ class ArbotiX:
     ## @param value 0 to turn the LED off, >0 to turn it on
     ##
     ## @return The error level.
-    def setLed(self, index, value):
-        return self.write(index, P_LED, [value])
-
+    def setLedOn(self, indexes):
+        cmds = []
+        for i in indexes:
+            cmds.append(FWCommand(self.servoMap[int(i)].id, SX_SET_LED, 1))
+        return self.writeCommands(cmds)
+    
+    def setLedOff(self, indexes):
+        cmds = []
+        for i in indexes:
+            cmds.append(FWCommand(self.servoMap[int(i)].id, SX_SET_LED, 0))
+        return self.writeCommands(cmds)
+    
     ## @brief Set the position of a servo.
     ##
     ## @param index The ID of the device to write.
@@ -285,9 +205,13 @@ class ArbotiX:
     ## @param value The position to go to in, in servo ticks.
     ##
     ## @return The error level.
-    def setPosition(self, index, value):
-        return self.write(index, P_GOAL_POSITION_L, [value%256, value>>8])
-
+    def setPosition(self, indexes, values):
+        cmds = []
+        for i,j in zip(indexes, range(0,len(indexes))):
+            if self.servoMap[int(i)].enabled:
+                cmds.append(FWCommand(self.servoMap[int(i)].id, SX_SET_POSITION, values[j]))
+        return self.writeCommands(cmds)
+    
     ## @brief Set the speed of a servo.
     ##
     ## @param index The ID of the device to write.
@@ -295,55 +219,36 @@ class ArbotiX:
     ## @param value The speed to write.
     ##
     ## @return The error level.
-    def setSpeed(self, index, value):
-        return self.write(index, P_GOAL_SPEED_L, [value%256, value>>8])
-
+    def setSpeed(self, indexes, values):
+        cmds = []
+        for i,j in zip(indexes, range(0, len(indexes))):
+            cmds.append(FWCommand(self.servoMap[int(i)].id, SX_SET_SPEED, values[j]))
+        return self.writeCommands(cmds)
+    
     ## @brief Get the position of a servo.
     ##
-    ## @param index The ID of the device to read.
+    ## @param index The index of the servo in the map
     ##
     ## @return The servo position.
     def getPosition(self, index):
-        values = self.read(index, P_PRESENT_POSITION_L, 2)
-        try:
-            return int(values[0]) + (int(values[1])<<8)
-        except:
-            return -1
-
+        return self.servoMap[index].position
+    
     ## @brief Get the speed of a servo.
     ##
     ## @param index The ID of the device to read.
     ##
     ## @return The servo speed.
     def getSpeed(self, index):
-        values = self.read(index, P_PRESENT_SPEED_L, 2)
-        try:
-            return int(values[0]) + (int(values[1])<<8)
-        except:
-            return -1
+        return self.servoMap[index].speed
         
-    ## @brief Get the goal speed of a servo.
-    ##
-    ## @param index The ID of the device to read.
-    ##
-    ## @return The servo goal speed.
-    def getGoalSpeed(self, index):
-        values = self.read(index, P_GOAL_SPEED_L, 2)
-        try:
-            return int(values[0]) + (int(values[1])<<8)
-        except:
-            return -1
-
     ## @brief Get the voltage of a device.
     ##
     ## @param index The ID of the device to read.
     ##
     ## @return The voltage, in Volts.
     def getVoltage(self, index):
-        try:
-            return int(self.read(index, P_PRESENT_VOLTAGE, 1)[0])/10.0
-        except:
-            return -1    
+       
+        return -1    
 
     ## @brief Get the temperature of a device.
     ##
@@ -351,66 +256,25 @@ class ArbotiX:
     ##
     ## @return The temperature, in degrees C.
     def getTemperature(self, index):
-        try:
-            return int(self.read(index, P_PRESENT_TEMPERATURE, 1)[0])
-        except:
-            return -1
+       
+        return -1
 
     ## @brief Determine if a device is moving.
     ##
     ## @param index The ID of the device to read.
     ##
     ## @return True if servo is moving.
-    def isMoving(self, index):
-        try:
-            d = self.read(index, P_MOVING, 1)[0]
-        except:
-            return True
-        return d != 0
     
-    ## @brief Put a servo into wheel mode (continuous rotation).
-    ##
-    ## @param index The ID of the device to write.
-    def enableWheelMode(self, index):
-        self.write(index, P_CCW_ANGLE_LIMIT_L, [0,0])
+    def isMoving(self, index):
+        return self.servoMap[index].moving
 
-    ## @brief Put a servo into servo mode.
-    ##
-    ## @param index The ID of the device to write.
-    ##
-    ## @param resolution The resolution of the encoder on the servo. NOTE: if using 
-    ## 12-bit resolution servos (EX-106, MX-28, etc), you must pass resolution = 12.
-    ##
-    ## @return 
-    def disableWheelMode(self, index, resolution=10):
-        resolution = (2 ** resolution) - 1
-        self.write(index, P_CCW_ANGLE_LIMIT_L, [resolution%256,resolution>>8])
-
-    ## Direction definition for setWheelSpeed
-    FORWARD = 0
-    ## Direction definition for setWheelSpeed
-    BACKWARD = 1
-
-    ## @brief Set the speed and direction of a servo which is in wheel mode (continuous rotation).
-    ##
-    ## @param index The ID of the device to write.
-    ##
-    ## @param direction The direction of rotation, either FORWARD or BACKWARD
-    ##
-    ## @param speed The speed to move at (0-1023).
-    ##
-    ## @return 
-    def setWheelSpeed(self, index, direction, speed):
-        if speed > 1023:
-            speed = 1023
-        if direction == self.FORWARD:
-            # 0~1023 is forward, it is stopped by setting to 0 while rotating to CCW direction.
-            self.write(index, P_GOAL_SPEED_L, [speed%256, speed>>8])
-        else:
-            # 1024~2047 is backward, it is stopped by setting to 1024 while rotating to CW direction.
-            speed += 1024
-            self.write(index, P_GOAL_SPEED_L, [speed%256, speed>>8])
-
+    def isEnabled(self, index):
+        return self.servoMap[index].enabled
+    
+    def getLoad(self, index):
+        return self.servoMap[index].load
+    
+    
     ###########################################################################
     # Extended ArbotiX Driver
 

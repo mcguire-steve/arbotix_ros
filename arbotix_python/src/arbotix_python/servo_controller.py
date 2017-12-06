@@ -45,7 +45,7 @@ class DynamixelServo(Joint):
         n = ns+"/"+name+"/"
         
         self.id = int(rospy.get_param(n+"id"))
-        self.ticks = rospy.get_param(n+"ticks", 1024)
+        self.ticks = rospy.get_param(n+"ticks", 4096)
         self.neutral = rospy.get_param(n+"neutral", self.ticks/2)
         if self.ticks == 4096:
             self.range = 360.0
@@ -70,6 +70,7 @@ class DynamixelServo(Joint):
         self.desired = 0.0                      # desired position (radians)
         self.last_cmd = 0.0                     # last position sent (radians)
         self.velocity = 0.0                     # moving speed
+        self.load = 0 #effort as reported by the servo 
         self.enabled = True                     # can we take commands?
         self.active = False                     # are we under torque control?
         self.last = rospy.Time.now()
@@ -121,6 +122,7 @@ class DynamixelServo(Joint):
             return None
 
     def setCurrentFeedback(self, reading):
+       
         """ Update angle in radians by reading from servo, or by 
             using position passed in from a sync read (in ticks). """
         if reading > -1 and reading < self.ticks:     # check validity
@@ -128,12 +130,13 @@ class DynamixelServo(Joint):
             self.total_reads += 1
             last_angle = self.position
             self.position = self.ticksToAngle(reading)
+            
             # update velocity estimate
             t = rospy.Time.now()
             self.velocity = (self.position - last_angle)/((t - self.last).to_nsec()/1000000000.0)
             self.last = t
         else:
-            rospy.logdebug("Invalid read of servo: id " + str(self.id) + ", value " + str(reading))
+            rospy.loginfo("Invalid read of servo: id " + str(self.id) + ", value " + str(reading))
             self.errors += 1
             self.total_reads += 1
             return
@@ -214,9 +217,10 @@ class DynamixelServo(Joint):
         """ Turn on/off servo torque, so that it is pose-able. """
         if req.enable:
             self.enabled = True
+            self.device.enableTorque([self.id])
         else:
             if not self.device.fake:
-                self.device.disableTorque(self.id)
+                self.device.disableTorque([self.id])
             self.dirty = False
             self.enabled = False
             self.active = False
@@ -225,7 +229,7 @@ class DynamixelServo(Joint):
     def relaxCb(self, req):
         """ Turn off servo torque, so that it is pose-able. """
         if not self.device.fake:
-            self.device.disableTorque(self.id)
+            self.device.disableTorque([self.id])
         self.dirty = False
         self.active = False
         return RelaxResponse()
@@ -246,7 +250,7 @@ class DynamixelServo(Joint):
             Don't allow 0 which means "max speed" to a Dynamixel in joint mode. """
         if not self.device.fake:
             ticks_per_sec = max(1, int(self.speedToTicks(req.speed)))
-            self.device.setSpeed(self.id, ticks_per_sec)
+            self.device.setSpeed([self.id], [ticks_per_sec])
         return SetSpeedResponse()
 
 class HobbyServo(Joint):
@@ -415,7 +419,7 @@ class ServoController(Controller):
                 for joint in self.dynamixels:
                     v = joint.interpolate(1.0/self.w_delta.to_sec())
                     if v != None:   # if was dirty      
-                        self.device.setPosition(joint.id, int(v))
+                        self.device.setPosition([joint.id], [int(v)])
             for joint in self.hobbyservos: 
                 v = joint.interpolate(1.0/self.w_delta.to_sec())
                 if v != None:   # if it was dirty   
@@ -423,6 +427,7 @@ class ServoController(Controller):
             self.w_next = rospy.Time.now() + self.w_delta
 
     def getDiagnostics(self):
+        return None
         """ Update status of servos (voltages, temperatures). """
         if self.iter % 5 == 0 and not self.fake:
             if self.device.use_sync_read:
@@ -458,7 +463,7 @@ class ServoController(Controller):
         return None
 
     def enableCb(self, req):
-        """ Turn on/off all servos torque, so that they are pose-able. """
+        """ Turn on all servos torque, so that they are pose-able. """
         for joint in self.dynamixels:
             resp = joint.enableCb(req)
         return resp
